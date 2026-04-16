@@ -2,19 +2,13 @@ import csv
 import logging
 from typing import Any
 
+from src.meta_client import extract_meta_metadata
 from src.platform_utils import detect_platform, normalize_url
 
 LOGGER = logging.getLogger(__name__)
 PROGRESS_INTERVAL = 25
-REQUEST_TIMEOUT = 10
 DESCRIPTION_MAX_LENGTH = 300
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-}
+SUPPORTED_METADATA_PLATFORMS = {"youtube", "facebook", "instagram"}
 METADATA_FIELDS = ["title", "description", "source_name"]
 
 
@@ -35,12 +29,13 @@ def enrich_links(input_csv_path: str, output_csv_path: str) -> None:
             for index, row in enumerate(reader, start=1):
                 metadata = _empty_metadata()
                 url = normalize_url((row.get("url") or "").strip())
+                platform = _resolve_platform(row, url)
 
                 try:
-                    if url:
-                        metadata = _extract_metadata_for_row(row, url)
-                    else:
+                    if not url:
                         LOGGER.warning("Row %s has no URL; leaving metadata empty", index)
+                    else:
+                        metadata = _extract_metadata_for_row(platform, url)
                 except Exception as exc:
                     LOGGER.warning(
                         "Metadata extraction failed for row %s (%s): %s",
@@ -48,6 +43,7 @@ def enrich_links(input_csv_path: str, output_csv_path: str) -> None:
                         url or "missing-url",
                         exc,
                     )
+                    metadata = _empty_metadata()
 
                 enriched_row = dict(row)
                 enriched_row.update(metadata)
@@ -88,71 +84,35 @@ def extract_youtube_metadata(url: str) -> dict[str, str | None]:
     return metadata
 
 
-def extract_social_metadata(url: str) -> dict[str, str | None]:
-    metadata = _empty_metadata()
-
-    soup = _fetch_soup(url)
-    if soup is None:
-        return metadata
-
-    metadata["title"] = _extract_meta_content(soup, "property", "og:title")
-    metadata["description"] = _extract_meta_content(soup, "property", "og:description")
-    metadata["source_name"] = _extract_meta_content(soup, "property", "og:site_name")
-    return metadata
+def extract_social_metadata(platform: str, url: str) -> dict[str, str | None]:
+    meta_result = extract_meta_metadata(url, platform, description_limit=DESCRIPTION_MAX_LENGTH)
+    return {
+        "title": meta_result.get("title"),
+        "description": meta_result.get("description"),
+        "source_name": meta_result.get("source_name"),
+    }
 
 
 def extract_generic_metadata(url: str) -> dict[str, str | None]:
-    metadata = _empty_metadata()
-
-    soup = _fetch_soup(url)
-    if soup is None:
-        return metadata
-
-    title_tag = soup.find("title")
-    if title_tag and title_tag.string:
-        metadata["title"] = _clean_text(title_tag.string)
-
-    return metadata
+    # Unsupported platforms are intentionally skipped to avoid network calls.
+    return _empty_metadata()
 
 
-def _extract_metadata_for_row(row: dict[str, Any], url: str) -> dict[str, str | None]:
-    platform = (row.get("platform") or "").strip().lower() or detect_platform(url)
-
+def _extract_metadata_for_row(platform: str, url: str) -> dict[str, str | None]:
     if platform == "youtube":
         return extract_youtube_metadata(url)
     if platform in {"facebook", "instagram"}:
-        return extract_social_metadata(url)
+        return extract_social_metadata(platform, url)
     return extract_generic_metadata(url)
 
 
-def _fetch_soup(url: str):
-    try:
-        import requests
-        from bs4 import BeautifulSoup
-    except ImportError as exc:
-        LOGGER.warning("Missing HTML parsing dependency for %s: %s", url, exc)
-        return None
-
-    try:
-        response = requests.get(url, headers=DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-    except Exception as exc:
-        LOGGER.warning("HTTP request failed for %s: %s", url, exc)
-        return None
-
-    content_type = (response.headers.get("Content-Type") or "").lower()
-    if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
-        LOGGER.info("Skipping non-HTML response for %s (%s)", url, content_type or "unknown")
-        return None
-
-    return BeautifulSoup(response.text, "html.parser")
-
-
-def _extract_meta_content(soup, attribute_name: str, attribute_value: str) -> str | None:
-    tag = soup.find("meta", attrs={attribute_name: attribute_value})
-    if not tag:
-        return None
-    return _clean_text(tag.get("content"))
+def _resolve_platform(row: dict[str, Any], url: str) -> str:
+    platform = (row.get("platform") or "").strip().lower()
+    if platform:
+        return platform
+    if not url:
+        return "other"
+    return detect_platform(url)
 
 
 def _truncate_text(value: Any, limit: int) -> str | None:
@@ -170,7 +130,8 @@ def _clean_text(value: Any) -> str | None:
     return text or None
 
 
-def _empty_metadata() -> dict[str, str | None]:
+def _empty_metadata(
+) -> dict[str, str | None]:
     return {
         "title": None,
         "description": None,
