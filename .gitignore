@@ -2,5 +2,7 @@
 __pycache__/
 *.pyc
 .env
-data/processed/*.csv
-data/raw/
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep

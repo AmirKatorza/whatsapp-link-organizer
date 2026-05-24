@@ -1,5 +1,6 @@
 import csv
 import logging
+import os
 from typing import Any
 
 from src.meta_client import extract_meta_metadata
@@ -93,6 +94,37 @@ def extract_social_metadata(platform: str, url: str) -> dict[str, str | None]:
     }
 
 
+def extract_social_metadata_ytdlp(platform: str, url: str) -> dict[str, str | None]:
+    cookies_file = f"data/raw/{platform}_cookies.txt"
+    if not os.path.exists(cookies_file):
+        LOGGER.info("No cookies file at %s; skipping yt-dlp enrichment for %s", cookies_file, url)
+        return _empty_metadata()
+
+    try:
+        from yt_dlp import YoutubeDL
+    except ImportError:
+        return _empty_metadata()
+
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "cookiefile": cookies_file,
+    }
+    try:
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False) or {}
+    except Exception as exc:
+        LOGGER.warning("yt-dlp failed for %s (%s): %s", platform, url, exc)
+        return _empty_metadata()
+
+    return {
+        "title": _clean_text(info.get("title")),
+        "source_name": _clean_text(info.get("uploader") or info.get("channel")),
+        "description": _truncate_text(info.get("description"), DESCRIPTION_MAX_LENGTH),
+    }
+
+
 def extract_generic_metadata(url: str) -> dict[str, str | None]:
     # Unsupported platforms are intentionally skipped to avoid network calls.
     return _empty_metadata()
@@ -102,7 +134,14 @@ def _extract_metadata_for_row(platform: str, url: str) -> dict[str, str | None]:
     if platform == "youtube":
         return extract_youtube_metadata(url)
     if platform in {"facebook", "instagram"}:
-        return extract_social_metadata(platform, url)
+        # Tier 1: Meta API (when token is approved and set)
+        if (os.getenv("META_ACCESS_TOKEN") or "").strip():
+            result = extract_social_metadata(platform, url)
+            if result.get("title"):
+                return result
+            LOGGER.info("Meta API returned no title for %s; falling back to yt-dlp", url)
+        # Tier 2: yt-dlp with browser cookies
+        return extract_social_metadata_ytdlp(platform, url)
     return extract_generic_metadata(url)
 
 

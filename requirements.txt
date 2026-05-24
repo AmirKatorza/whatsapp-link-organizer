@@ -1,4 +1,6 @@
+anthropic
 beautifulsoup4
+openpyxl
 pandas==2.3.0
 playwright
 python-dotenv

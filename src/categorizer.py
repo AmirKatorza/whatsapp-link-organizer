@@ -6,7 +6,6 @@ import re
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
-from urllib import error, request
 from typing import Any
 
 try:
@@ -194,7 +193,7 @@ CATEGORY_RULES: dict[str, dict[str, float]] = {
 class CategorizerConfig:
     rule_confidence_threshold: float
     llm_fallback_enabled: bool
-    openai_model: str
+    anthropic_model: str
 
 
 @dataclass(frozen=True)
@@ -265,70 +264,40 @@ def get_categorizer_config() -> CategorizerConfig:
     return CategorizerConfig(
         rule_confidence_threshold=max(0.0, min(1.0, threshold)),
         llm_fallback_enabled=_parse_bool(os.getenv("CATEGORIZATION_ENABLE_LLM_FALLBACK", "1")),
-        openai_model=(os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip(),
+        anthropic_model=(os.getenv("ANTHROPIC_MODEL") or "claude-haiku-4-5-20251001").strip(),
     )
 
 
 def classify_with_llm(text_payload: str) -> dict[str, Any]:
     load_dotenv()
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    model = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+    api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
+    model = (os.getenv("ANTHROPIC_MODEL") or "claude-haiku-4-5-20251001").strip()
 
     if not api_key:
         return {
             "category": "Other / Review",
             "confidence": 0.0,
-            "reason": "OPENAI_API_KEY is not configured.",
+            "reason": "ANTHROPIC_API_KEY is not configured.",
             "status": "unavailable",
         }
 
-    schema = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "category": {"type": "string", "enum": PREFERRED_CATEGORIES},
-            "confidence": {"type": "number"},
-            "reason": {"type": "string"},
-        },
-        "required": ["category", "confidence", "reason"],
-    }
-    request_body = {
-        "model": model,
-        "input": [
-            {
-                "role": "system",
-                "content": (
-                    "Classify short social-media link metadata into exactly one category from the provided list. "
-                    "Return JSON only. Use only the evidence in the text. If the evidence is weak or mixed, "
-                    "choose 'Other / Review'. Keep the reason brief and practical."
-                ),
-            },
-            {"role": "user", "content": text_payload},
-        ],
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "link_categorization",
-                "schema": schema,
-                "strict": True,
-            }
-        },
-    }
-
     try:
-        http_request = request.Request(
-            "https://api.openai.com/v1/responses",
-            data=json.dumps(request_body).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
+        import anthropic as _anthropic
+        client = _anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=model,
+            max_tokens=256,
+            system=(
+                "Classify short social-media link metadata into exactly one category from the provided list. "
+                "Return JSON only with keys: category, confidence (0.0-1.0), reason. "
+                "Use only the evidence in the text. If the evidence is weak or mixed, "
+                "choose 'Other / Review'. Keep the reason under 200 characters."
+            ),
+            messages=[{"role": "user", "content": text_payload}],
         )
-        with request.urlopen(http_request, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (error.URLError, error.HTTPError, TimeoutError, ValueError) as exc:
-        LOGGER.warning("OpenAI categorization request failed: %s", exc)
+        raw_text = response.content[0].text
+    except Exception as exc:
+        LOGGER.warning("Anthropic categorization request failed: %s", exc)
         return {
             "category": "Other / Review",
             "confidence": 0.0,
@@ -337,10 +306,10 @@ def classify_with_llm(text_payload: str) -> dict[str, Any]:
         }
 
     try:
-        raw_text = _extract_openai_output_text(payload)
-        parsed = json.loads(raw_text)
-    except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
-        LOGGER.warning("Malformed OpenAI categorization response: %s", exc)
+        json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        parsed = json.loads(json_match.group() if json_match else raw_text)
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        LOGGER.warning("Malformed Anthropic categorization response: %s", exc)
         return {
             "category": "Other / Review",
             "confidence": 0.0,
@@ -520,21 +489,6 @@ def _categorize_row(row: dict[str, Any], config: CategorizerConfig) -> dict[str,
 def _count_keyword_occurrences(text: str, keyword: str) -> int:
     pattern = rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])"
     return len(re.findall(pattern, text))
-
-
-def _extract_openai_output_text(payload: dict[str, Any]) -> str:
-    output_text = payload.get("output_text")
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text
-
-    for output_item in payload.get("output", []):
-        for content_item in output_item.get("content", []):
-            if content_item.get("type") in {"output_text", "text"}:
-                text = content_item.get("text")
-                if isinstance(text, str) and text.strip():
-                    return text
-
-    raise KeyError("OpenAI response did not include output text.")
 
 
 def _clean_text(value: Any) -> str | None:
